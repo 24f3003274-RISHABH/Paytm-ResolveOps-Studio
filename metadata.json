@@ -1,0 +1,6 @@
+{
+  "name": "Paytm ResolveOps — Autonomous FinTech Operations Teammate",
+  "description": "Multi-Agent Dispute Resolution, Real-Time NPCI Banking Switch Reconciliation, Deterministic Financial Guardrails, and Indic Voice Execution for Paytm Build for India AI Hackathon.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
