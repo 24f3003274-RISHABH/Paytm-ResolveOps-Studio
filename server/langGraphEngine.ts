@@ -25,11 +25,65 @@ interface LiveGenAIWorkflowEnrichment {
   ai_latency_ms: number;
 }
 
+let geminiFlashQuotaExhausted = false;
+let geminiLiteQuotaExhausted = false;
+
+export type UserQueryFocus =
+  | 'WHY_ROOT_CAUSE'
+  | 'MERCHANT_SOUNDBOX_STATUS'
+  | 'UTR_BANK_TIMELINE_PROOF'
+  | 'DOUBLE_DEBIT_DUPLICATE'
+  | 'RBI_COMPENSATION_SLA'
+  | 'SECURITY_RISK_FREEZE'
+  | 'GENERAL_DISPUTE_RESOLUTION';
+
+export function detectUserQueryFocus(rawQuery: string): UserQueryFocus {
+  const q = rawQuery.toLowerCase();
+  if (
+    /\b(rbi|compensation|penalty|suo.?motu|100\/day|₹200|₹100|t\+5|5 days|delay compensation)\b/i.test(q) ||
+    /(मुआवजा|पेनल्टी|देरी का|5 दिन|आरबीआई)/i.test(q)
+  ) {
+    return 'RBI_COMPENSATION_SLA';
+  }
+  if (
+    /\b(twice|double|two times|2 times|duplicate|charged again|paid again)\b/i.test(q) ||
+    /(दो बार|डबल|दोबारा|दुबारा)/i.test(q)
+  ) {
+    return 'DOUBLE_DEBIT_DUPLICATE';
+  }
+  if (
+    /\b(utr|rrn|reference number|proof|receipt|bank statement|when will|how long|how much time|credited to bank|check balance)\b/i.test(q) ||
+    /(कब मिलेगा|कितना समय|कब तक|रसीद|प्रूफ|यूटीआर|खाते में आया)/i.test(q)
+  ) {
+    return 'UTR_BANK_TIMELINE_PROOF';
+  }
+  if (
+    /\b(shopkeeper|merchant|dukaan|soundbox|speaker|did they get|did merchant|receiver|reached)\b/i.test(q) ||
+    /(दुकानदार|साउंडबॉक्स|मर्चेंट|दुकान वाले|मिला क्या|पहुंचा)/i.test(q)
+  ) {
+    return 'MERCHANT_SOUNDBOX_STATUS';
+  }
+  if (
+    /\b(fraud|scam|suspicious|hack|block|freeze|cancel|safe|security|unauthorized)\b/i.test(q) ||
+    /(धोखाधड़ी|फ्रॉड|रोकें|ब्लॉक|सुरक्षित|कैंसिल)/i.test(q)
+  ) {
+    return 'SECURITY_RISK_FREEZE';
+  }
+  if (
+    /\b(why|reason|how did|what happened|cause|explain|kya hua|kyu|kyon)\b/i.test(q) ||
+    /(क्यों|कारण|रीजन|कैसे हुआ|क्या हुआ|ஏன்|காரணம்)/i.test(q)
+  ) {
+    return 'WHY_ROOT_CAUSE';
+  }
+  return 'GENERAL_DISPUTE_RESOLUTION';
+}
+
 async function runLiveGenAIWorkflowReasoning(params: {
   masked_user_query: string;
   txn: TransactionRow;
   switch_code: string;
   switch_status: string;
+  gateway_hop_trace: string;
   three_way_match_status: string;
   risk_score: number;
   policy_decision: PolicyDecisionOutput['decision'];
@@ -41,128 +95,189 @@ async function runLiveGenAIWorkflowReasoning(params: {
   fallback_voice: { indic: string; english: string; sarvam_model: string };
 }): Promise<LiveGenAIWorkflowEnrichment> {
   const aiStart = Date.now();
+  const queryFocus = detectUserQueryFocus(params.masked_user_query);
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    return {
-      intent_category: params.fallback_intent,
-      user_problem_summary: `Analyzed Paytm merchant/customer dispute for ${params.txn.txn_id} (₹${params.txn.amount.toLocaleString('en-IN')})`,
-      ai_root_cause_diagnosis: `${params.three_way_match_status} -> ${params.policy_decision} (${params.rule_triggered})`,
-      timely_handoff_or_action_brief:
-        params.policy_decision === 'HITL'
-          ? `Halted autonomous ledger write and handed off to L2 Settlement Officer with pre-audited switch & velocity telemetry.`
-          : `Executed autonomous MCP tool action (${params.policy_decision}) with settlement UTR ${params.settlement_utr || params.txn.utr}.`,
-      voice_script_indic: params.fallback_voice.indic,
-      voice_script_english: params.fallback_voice.english,
-      genai_model: 'sarvam-m / deterministic-fallback',
-      ai_latency_ms: 12,
-    };
-  }
 
-  try {
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-    });
+  if (apiKey && apiKey !== 'MY_GEMINI_API_KEY' && (!geminiFlashQuotaExhausted || !geminiLiteQuotaExhausted)) {
+    try {
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+      });
 
-    const langInstruction =
-      params.lang === 'ta-IN'
-        ? 'Tamil (written in Tamil script, warm and polite customer care tone)'
-        : params.lang === 'en-IN'
-        ? 'Indian English (warm, natural Paytm Soundbox / merchant support voice)'
-        : 'Natural conversational Hindi / Hinglish (written in Devanagari script with clear UTR & amount, warm polite merchant support tone)';
+      const langInstruction =
+        params.lang === 'ta-IN'
+          ? 'Tamil (written in Tamil script, warm and polite customer care tone)'
+          : params.lang === 'en-IN'
+          ? 'Indian English (warm, natural Paytm Soundbox / merchant support voice)'
+          : 'Natural conversational Hindi / Hinglish (written in Devanagari script with clear UTR & amount, warm polite merchant support tone)';
 
-    const prompt = `You are the GenAI reasoning engine inside Paytm ResolveOps (Track 3 Autonomous AI Teammate).
-A Paytm merchant or customer (Tier-1 to Tier-3 India) submitted this live voice/text dispute:
+      const prompt = `You are the GenAI reasoning engine inside Paytm ResolveOps (Track 3 Autonomous AI Teammate).
+A Paytm merchant or customer submitted this specific live query:
 "${params.masked_user_query}"
+Detected User Query Focus: ${queryFocus}
 
 Attached Transaction & SQLite Switch Telemetry:
 - Transaction ID: ${params.txn.txn_id}
 - RRN / UTR: ${params.txn.utr}
 - Merchant: ${params.txn.merchant_name}
+- Customer: ${params.txn.customer_name}
 - Bank: ${params.txn.bank_name}
 - Amount: ₹${params.txn.amount}
 - NPCI Switch Code: ${params.switch_code} (${params.switch_status})
+- Gateway Hop Trace: ${params.gateway_hop_trace}
 - 3-Way Recon Status: ${params.three_way_match_status}
 - Account Risk Score: ${params.risk_score}
 - Deterministic Policy Engine Decision (Node 3): ${params.policy_decision} (Rule: ${params.rule_triggered})
 - New Settlement / Reversal UTR: ${params.settlement_utr || 'Paused for Human L2 Operator Handoff'}
 - RBI T+5 Penalty Compensation: ₹${params.rbi_compensation_inr}
 
-Generate a JSON object demonstrating all 3 Track-3 Autonomous Teammate capabilities:
-1. intent_category: Short uppercase classification of the user's specific spoken/typed complaint (e.g., SOUNDBOX_SILENT_U69_TIMEOUT, DOUBLE_DEBIT_FUEL_REFUND, RBI_TAT_DELAY_COMPENSATION, HIGH_VALUE_ESCROW_HANDOFF, etc.)
-2. user_problem_summary: (Pillar 1: Understands User Problem) 1-2 sentence empathetic & concrete analysis of what the Paytm merchant/customer is experiencing on the ground (e.g. customer waiting at shop counter, Soundbox didn't announce, working capital stuck).
-3. ai_root_cause_diagnosis: (Pillar 2: Decides & Acts via Tools) 1-2 sentence technical root-cause synthesis combining the 3-way reconciliation telemetry (${params.three_way_match_status}) with the autonomous tool action executed (${params.policy_decision}).
-4. timely_handoff_or_action_brief: (Pillar 3: Timely Handoff / Resolution) If ${params.policy_decision} is HITL or SECURITY_BLOCK, write a genuine, non-hardcoded L2 operator handoff brief explaining why autonomous execution stopped and what the human officer should verify. Otherwise, state the exact autonomous settlement action completed and UTR issued.
-5. voice_script_indic: A natural, empathetic 2-sentence spoken response in ${langInstruction} that directly answers the user's specific problem, mentions ₹${params.txn.amount} and ${params.txn.merchant_name.split(',')[0]}, and states the exact outcome and UTR (${params.settlement_utr || params.txn.utr}). Keep under 380 characters.
-6. voice_script_english: Clean English translation of voice_script_indic.`;
+IMPORTANT: Tailor your entire response directly to the user's exact question ("${params.masked_user_query}") so different questions produce distinct, specific answers!
+Generate a JSON object with:
+1. intent_category: Short uppercase classification combining the user's question focus and scenario (e.g., ${queryFocus}_${params.switch_code}).
+2. user_problem_summary: 1-2 sentences directly addressing what the user asked ("${params.masked_user_query}") for ${params.txn.txn_id} (₹${params.txn.amount} at ${params.txn.merchant_name}).
+3. ai_root_cause_diagnosis: 1-2 sentences explaining the technical root cause from 3-way reconciliation (${params.three_way_match_status}, Hop: ${params.gateway_hop_trace}) that answers the user's question.
+4. timely_handoff_or_action_brief: Exact settlement action or L2 handoff taken (${params.policy_decision}, UTR: ${params.settlement_utr || params.txn.utr}).
+5. voice_script_indic: A natural, empathetic 2-3 sentence spoken response in ${langInstruction} that directly answers "${params.masked_user_query}", mentions ₹${params.txn.amount} and ${params.txn.merchant_name.split(',')[0]}, and gives the exact UTR (${params.settlement_utr || params.txn.utr}).
+6. voice_script_english: Clean English version directly answering "${params.masked_user_query}" with the exact telemetry and UTR.`;
 
-    const genPromise = ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            intent_category: { type: Type.STRING },
-            user_problem_summary: { type: Type.STRING },
-            ai_root_cause_diagnosis: { type: Type.STRING },
-            timely_handoff_or_action_brief: { type: Type.STRING },
-            voice_script_indic: { type: Type.STRING },
-            voice_script_english: { type: Type.STRING },
-          },
-          required: [
-            'intent_category',
-            'user_problem_summary',
-            'ai_root_cause_diagnosis',
-            'timely_handoff_or_action_brief',
-            'voice_script_indic',
-            'voice_script_english',
-          ],
-        },
-      },
-    });
+      const modelsToTry = [
+        !geminiFlashQuotaExhausted ? 'gemini-3.8-flash' : null,
+        !geminiLiteQuotaExhausted ? 'gemini-3.1-flash-lite' : null,
+      ].filter(Boolean) as string[];
 
-    const timeoutPromise = new Promise<null>((resolve) =>
-      setTimeout(() => resolve(null), 3500)
-    );
+      for (const modelName of modelsToTry) {
+        const genPromise = ai.models
+          .generateContent({
+            model: modelName,
+            contents: prompt,
+            config: {
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  intent_category: { type: Type.STRING },
+                  user_problem_summary: { type: Type.STRING },
+                  ai_root_cause_diagnosis: { type: Type.STRING },
+                  timely_handoff_or_action_brief: { type: Type.STRING },
+                  voice_script_indic: { type: Type.STRING },
+                  voice_script_english: { type: Type.STRING },
+                },
+                required: [
+                  'intent_category',
+                  'user_problem_summary',
+                  'ai_root_cause_diagnosis',
+                  'timely_handoff_or_action_brief',
+                  'voice_script_indic',
+                  'voice_script_english',
+                ],
+              },
+            },
+          })
+          .catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota')) {
+              if (modelName === 'gemini-3.8-flash') geminiFlashQuotaExhausted = true;
+              if (modelName === 'gemini-3.1-flash-lite') geminiLiteQuotaExhausted = true;
+            }
+            return null;
+          });
 
-    const response = await Promise.race([genPromise, timeoutPromise]);
-    if (response && response.text) {
-      const parsed = JSON.parse(response.text);
-      return {
-        intent_category: parsed.intent_category || params.fallback_intent,
-        user_problem_summary:
-          parsed.user_problem_summary ||
-          `Analyzed user dispute for ${params.txn.txn_id}`,
-        ai_root_cause_diagnosis:
-          parsed.ai_root_cause_diagnosis ||
-          `${params.three_way_match_status} -> ${params.policy_decision}`,
-        timely_handoff_or_action_brief:
-          parsed.timely_handoff_or_action_brief ||
-          `Completed ${params.policy_decision} routing for ${params.txn.txn_id}`,
-        voice_script_indic: parsed.voice_script_indic || params.fallback_voice.indic,
-        voice_script_english: parsed.voice_script_english || params.fallback_voice.english,
-        genai_model: 'Sarvam AI + Gemini 3.8 Flash (Live Reasoning)',
-        ai_latency_ms: Date.now() - aiStart,
-      };
+        const timeoutPromise = new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), 3500)
+        );
+
+        const response = await Promise.race([genPromise, timeoutPromise]);
+        if (response && response.text) {
+          const parsed = JSON.parse(response.text);
+          return {
+            intent_category: parsed.intent_category || `${queryFocus}_${params.switch_code}`,
+            user_problem_summary:
+              parsed.user_problem_summary ||
+              `Analyzed query "${params.masked_user_query}" for ${params.txn.txn_id} (₹${params.txn.amount.toLocaleString('en-IN')} at ${params.txn.merchant_name}).`,
+            ai_root_cause_diagnosis:
+              parsed.ai_root_cause_diagnosis ||
+              `Cross-checked ${params.txn.bank_name} CBS, NPCI Switch (${params.switch_code}), and Paytm Acquirer Ledger (${params.three_way_match_status}).`,
+            timely_handoff_or_action_brief:
+              parsed.timely_handoff_or_action_brief ||
+              `Completed ${params.policy_decision} resolution for ${params.txn.txn_id}.`,
+            voice_script_indic: parsed.voice_script_indic || params.fallback_voice.indic,
+            voice_script_english: parsed.voice_script_english || params.fallback_voice.english,
+            genai_model: `Sarvam AI + ${modelName} (Live NLU)`,
+            ai_latency_ms: Date.now() - aiStart,
+          };
+        }
+      }
+    } catch {
+      // Fallback to deterministic query-aware NLU synthesis below
     }
-  } catch (err) {
-    console.warn('Live GenAI enrichment fallback:', err);
   }
 
+  // Query-specific, scenario-specific human-readable investigation narratives
+  const merchantShort = params.txn.merchant_name.split(',')[0];
+  const amtFmt = `₹${params.txn.amount.toLocaleString('en-IN')}`;
+  const queryExcerpt = params.masked_user_query.slice(0, 90);
+
+  const detailedProblemSummary =
+    params.policy_decision === 'SECURITY_BLOCK'
+      ? `Intercepted adversarial instruction in query ("${queryExcerpt}") attempting to bypass settlement rules on ${params.txn.txn_id} (${amtFmt} at ${merchantShort}).`
+      : queryFocus === 'WHY_ROOT_CAUSE'
+      ? `User asked for the exact technical reason why ${amtFmt} at ${merchantShort} (UTR: ${params.txn.utr}) encountered status ${params.switch_code}.`
+      : queryFocus === 'MERCHANT_SOUNDBOX_STATUS'
+      ? `User asked whether merchant ${merchantShort} received the ${amtFmt} payment or why the Paytm Soundbox did not confirm settlement.`
+      : queryFocus === 'UTR_BANK_TIMELINE_PROOF'
+      ? `User requested official banking UTR proof and credit timeline for ${amtFmt} debited from ${params.txn.bank_name} (RRN: ${params.txn.utr}).`
+      : queryFocus === 'DOUBLE_DEBIT_DUPLICATE'
+      ? `User reported a double-debit / duplicate deduction concern of ${amtFmt} at ${merchantShort} (${params.txn.txn_id}) and requested immediate reversal.`
+      : queryFocus === 'RBI_COMPENSATION_SLA'
+      ? `User inquired about RBI T+5 Turnaround Time (TAT) delay SLA and ₹100/day suo-motu compensation for ${params.txn.txn_id} (${amtFmt}).`
+      : queryFocus === 'SECURITY_RISK_FREEZE'
+      ? `User raised a security / account safety query on ${params.txn.txn_id} (${amtFmt} at ${merchantShort}, Risk Score: ${params.risk_score.toFixed(2)}).`
+      : `Customer ${params.txn.customer_name} queried "${queryExcerpt}" regarding ${amtFmt} from ${params.txn.bank_name} to ${merchantShort} (UTR: ${params.txn.utr}).`;
+
+  const detailedRootCause =
+    params.policy_decision === 'SECURITY_BLOCK'
+      ? `Security Gateway detected prompt-injection directives in input payload. Ledger mutation was blocked prior to switch execution.`
+      : queryFocus === 'WHY_ROOT_CAUSE'
+      ? `Gateway Hop Trace [${params.gateway_hop_trace}] shows ${params.txn.bank_name} CBS processed the leg, while NPCI UDIR returned code ${params.switch_code} (${params.switch_status}). 3-Way Recon: ${params.three_way_match_status}.`
+      : queryFocus === 'MERCHANT_SOUNDBOX_STATUS'
+      ? params.switch_code === 'SUCCESS' || params.switch_code === 'DEEMED_UP'
+        ? `NPCI Switch cleared ${amtFmt} (${params.switch_code}), but the acquirer sub-ledger webhook to ${merchantShort}'s Soundbox timed out. MCP-C triggered an instant URCS Credit Adjustment.`
+        : `3-Way Recon confirmed ${merchantShort} did NOT receive ${amtFmt} (Merchant Credited = FALSE due to NPCI ${params.switch_code}). Money was trapped in clearing and reversed to ${params.txn.bank_name}.`
+      : queryFocus === 'UTR_BANK_TIMELINE_PROOF'
+      ? `Original NPCI RRN ${params.txn.utr} was cross-matched with ${params.txn.bank_name} CBS. New Settlement Reference ${params.settlement_utr || 'L2-ESCROW-REVIEW'} is locked with idempotency key IDEMP-${params.txn.txn_id}.`
+      : params.switch_code === 'U69' && params.rbi_compensation_inr > 0
+      ? `${params.txn.bank_name} CBS confirmed debit while NPCI Switch logged Code U69 (Beneficiary Timeout). Because T+5 SLA was breached, RBI mandate triggers principal refund plus ₹${params.rbi_compensation_inr} compensation.`
+      : params.switch_code === 'U69' && params.policy_decision === 'AUTO_REVERSE'
+      ? `MCP-A confirmed NPCI Switch Code U69 (Response Timeout on hop ${params.gateway_hop_trace}), MCP-B verified low risk (${params.risk_score.toFixed(2)}), and MCP-C confirmed ${params.txn.bank_name} debited ${amtFmt} while ${merchantShort} remained uncredited.`
+      : params.switch_code === 'SUCCESS' || params.switch_code === 'DEEMED_UP'
+      ? `MCP-A verified NPCI Switch cleared the transaction (${params.switch_code}), and MCP-C identified a missing acquirer webhook to ${merchantShort}'s sub-ledger.`
+      : params.switch_code === 'PENDING'
+      ? `MCP-A and MCP-C confirmed the transaction is currently inside NPCI's active T+0 clearing window (${params.gateway_hop_trace}). Duplicate reversal is prevented to avoid double-credit.`
+      : `MCP-B & Policy Router flagged this ${amtFmt} transaction (Switch: ${params.switch_code}, Risk Score: ${params.risk_score.toFixed(2)}) under high-value / velocity controls requiring L2 specialist authorization.`;
+
+  const detailedClosureBrief =
+    params.policy_decision === 'HITL'
+      ? `Paused autonomous ledger execution at Node 4C and routed pre-audited 3-way reconciliation dossier to L2 Settlement Officer for 1-click review.`
+      : params.policy_decision === 'SECURITY_BLOCK'
+      ? `Quarantined adversarial request at Node 4C with zero ledger mutations and logged security alert to immutable audit chain.`
+      : params.policy_decision === 'AUTO_REVERSE_RBI_COMP'
+      ? `Credited ${amtFmt} principal refund plus ₹${params.rbi_compensation_inr} RBI TAT compensation to ${params.txn.bank_name} under Ref UTR ${params.settlement_utr}.`
+      : params.policy_decision === 'CREDIT_RETRY'
+      ? `Triggered instant URCS merchant settlement credit of ${amtFmt} to ${merchantShort} under Ref UTR ${params.settlement_utr} and notified Soundbox.`
+      : params.policy_decision === 'INFO_ONLY'
+      ? `Verified existing settlement state (${params.settlement_utr || params.txn.utr}) with idempotency lock and updated customer with live status.`
+      : `Issued instant NPCI UDIR reversal of ${amtFmt} back to ${params.txn.bank_name} under Settlement UTR ${params.settlement_utr}.`;
+
   return {
-    intent_category: params.fallback_intent,
-    user_problem_summary: `Analyzed dispute payload for ${params.txn.txn_id} (₹${params.txn.amount.toLocaleString('en-IN')})`,
-    ai_root_cause_diagnosis: `${params.three_way_match_status} -> ${params.policy_decision} (${params.rule_triggered})`,
-    timely_handoff_or_action_brief:
-      params.policy_decision === 'HITL'
-        ? `Halted autonomous ledger write and handed off to L2 Settlement Officer with pre-audited switch & velocity telemetry.`
-        : `Executed autonomous MCP tool action (${params.policy_decision}) with settlement UTR ${params.settlement_utr || params.txn.utr}.`,
+    intent_category: `${queryFocus}_${params.switch_code}`,
+    user_problem_summary: detailedProblemSummary,
+    ai_root_cause_diagnosis: detailedRootCause,
+    timely_handoff_or_action_brief: detailedClosureBrief,
     voice_script_indic: params.fallback_voice.indic,
     voice_script_english: params.fallback_voice.english,
-    genai_model: 'Sarvam AI + Deterministic Guardrail',
+    genai_model: 'Sarvam AI + ResolveOps Query-Aware NLU Engine',
     ai_latency_ms: Date.now() - aiStart,
   };
 }
@@ -380,7 +495,7 @@ export function mcpServerC_executeSettlementReversal(params: {
       : null;
   const now = new Date().toISOString();
 
-  const uniqueIdempKey = `${params.idempotency_key}-${Date.now().toString().slice(-4)}`;
+  const uniqueIdempKey = `${params.idempotency_key}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
   db.prepare(`
     UPDATE ledger
@@ -427,7 +542,9 @@ export function mcpServerC_executeSettlementReversal(params: {
 }
 
 /**
- * Node 5: Indic Voice Synthesis (Sarvam AI Bulbul v1 Female Voice Script Generator)
+ * Node 5: Indic Voice Synthesis (Sarvam AI Bulbul Female Voice Script Generator)
+ * Generates distinct, query-aware responses in Hindi, Tamil, and English based on both
+ * the user's specific question focus AND the 3-way reconciliation outcome.
  */
 export function buildIndicVoiceScripts(params: {
   txn: TransactionRow;
@@ -436,70 +553,197 @@ export function buildIndicVoiceScripts(params: {
   settlement_utr: string | null;
   rbi_compensation_inr?: number;
   lang: 'hi-IN' | 'en-IN' | 'ta-IN';
+  user_query?: string;
+  gateway_hop_trace?: string;
+  risk_score?: number;
 }): { indic: string; english: string; sarvam_model: string } {
-  const { txn, decision, switch_code, settlement_utr, rbi_compensation_inr = 0, lang } = params;
+  const {
+    txn,
+    decision,
+    switch_code,
+    settlement_utr,
+    rbi_compensation_inr = 0,
+    lang,
+    user_query = '',
+    gateway_hop_trace = 'ISSUER_CBS -> NPCI_SWITCH -> ACQUIRER',
+    risk_score = 0.05,
+  } = params;
   const shortMerchant = txn.merchant_name.split(',')[0];
   const amtFormatted = `₹${txn.amount.toLocaleString('en-IN')}`;
+  const queryFocus = detectUserQueryFocus(user_query);
+  const refUtr = settlement_utr || txn.utr;
 
   if (decision === 'SECURITY_BLOCK') {
     return {
-      indic: `सुरक्षा चेतावनी: इस डिस्प्यूट पेलोड में नियम बायपास (Prompt Injection) का प्रयास पकड़ा गया है। ₹${txn.amount.toLocaleString('en-IN')} का ऑटो-रिफंड ब्लॉक कर दिया गया है।`,
-      english: `Security Guardrail Alert: Adversarial prompt injection detected on ${txn.txn_id}. Autonomous refund of ${amtFormatted} has been blocked and logged.`,
-      sarvam_model: 'sarvam-bulbul:v1 (Meera Female Voice)',
+      indic: `सुरक्षा चेतावनी: आपके संदेश में नियम बायपास (Prompt Injection) का प्रयास पकड़ा गया है। ${shortMerchant} (${txn.txn_id}) के ${amtFormatted} ट्रांजैक्शन पर कोई बदलाव नहीं किया गया है और इसे सिक्योरिटी टीम को लॉग कर दिया गया है।`,
+      english: `Security Guardrail Alert: Adversarial prompt injection detected on ${txn.txn_id} (${amtFormatted} at ${shortMerchant}). Autonomous ledger mutation was blocked with zero funds moved.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+    };
+  }
+
+  // Tailor response when user specifically asks WHY / ROOT CAUSE
+  if (queryFocus === 'WHY_ROOT_CAUSE') {
+    if (decision === 'HITL') {
+      return {
+        indic: `आपके प्रश्न का उत्तर: ${shortMerchant} का ${amtFormatted} ट्रांजैक्शन (${txn.txn_id}) इसलिए रुका है क्योंकि NPCI कोड ${switch_code} और रिस्क स्कोर ${risk_score.toFixed(2)} सुरक्षा सीमा से ऊपर हैं। सीनियर स्पेशलिस्ट इसकी जांच कर रहे हैं।`,
+        english: `Why this happened: Your ${amtFormatted} transaction at ${shortMerchant} (${txn.txn_id}) triggered NPCI code ${switch_code} (Hop: ${gateway_hop_trace}) with risk score ${risk_score.toFixed(2)}, requiring mandatory L2 specialist sign-off before refund.`,
+        sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+      };
+    }
+    if (decision === 'CREDIT_RETRY') {
+      return {
+        indic: `आपके प्रश्न का उत्तर: ${txn.bank_name} और NPCI स्विच (${switch_code}) से ${amtFormatted} सफल था, लेकिन नेटवर्क हॉप (${gateway_hop_trace}) में वेबहुक ड्रॉप होने से ${shortMerchant} के साउंडबॉक्स पर कन्फर्मेशन नहीं आया। हमने URCS क्रेडिट (UTR: ${refUtr}) से इसे ठीक कर दिया है।`,
+        english: `Why this happened: ${txn.bank_name} and NPCI Switch cleared ${amtFormatted} (${switch_code}), but the acquirer webhook dropped along [${gateway_hop_trace}]. ResolveOps completed a URCS credit adjustment to ${shortMerchant} under UTR ${refUtr}.`,
+        sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+      };
+    }
+    return {
+      indic: `आपके प्रश्न का उत्तर: ${txn.bank_name} से ${amtFormatted} कटने के बाद नेटवर्क हॉप (${gateway_hop_trace}) पर NPCI स्विच टाइमआउट (Code: ${switch_code}) हुआ था। इसलिए पैसे ${shortMerchant} को नहीं मिले और हमने तुरंत आपके खाते में रिफंड (UTR: ${refUtr}) जमा कर दिया है।`,
+      english: `Why this happened: After ${txn.bank_name} debited ${amtFormatted}, the payment hit an NPCI response timeout (Code: ${switch_code}) at hop [${gateway_hop_trace}]. Because ${shortMerchant} was never credited, ResolveOps reversed ${amtFormatted} to your bank under UTR ${refUtr}.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+    };
+  }
+
+  // Tailor response when user specifically asks whether MERCHANT / SHOPKEEPER received money
+  if (queryFocus === 'MERCHANT_SOUNDBOX_STATUS') {
+    if (decision === 'CREDIT_RETRY') {
+      return {
+        indic: `मर्चेंट स्टेटस: पहले वेबहुक देरी के कारण ${shortMerchant} को ${amtFormatted} नहीं मिला था, लेकिन अब Paytm ResolveOps ने 3-Way मिलान करके मर्चेंट लेजर में ${amtFormatted} जमा कर दिया है (UTR: ${refUtr}) और साउंडबॉक्स अलर्ट भेज दिया है।`,
+        english: `Merchant Settlement Status: ${shortMerchant} initially missed the webhook for ${amtFormatted} despite NPCI ${switch_code}. ResolveOps has now credited ${shortMerchant}'s merchant ledger via URCS (UTR: ${refUtr}) and triggered Soundbox confirmation.`,
+        sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+      };
+    }
+    return {
+      indic: `मर्चेंट स्टेटस की पुष्टि: 3-Way रिकॉन्सिलिएशन में पाया गया कि ${shortMerchant} को आपका ${amtFormatted} बिल्कुल नहीं मिला (Merchant Credited: NO, Code: ${switch_code})। इसलिए पूरी राशि आपके ${txn.bank_name} खाते में रिफंड कर दी गई है (UTR: ${refUtr})।`,
+      english: `Merchant Status Confirmed: 3-Way Reconciliation verified that ${shortMerchant} did NOT receive your ${amtFormatted} (Merchant Credited: False, Switch: ${switch_code}). Your money has been safely refunded to ${txn.bank_name} under UTR ${refUtr}.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+    };
+  }
+
+  // Tailor response when user specifically asks for UTR / RECEIPT / BANK TIMELINE
+  if (queryFocus === 'UTR_BANK_TIMELINE_PROOF') {
+    return {
+      indic: `बैंक UTR और टाइमलाइन प्रूफ: ट्रांजैक्शन ${txn.txn_id} (${amtFormatted}) का मूल NPCI RRN ${txn.utr} है और नया सेटलमेंट रेफरेंस ${refUtr} है। ${
+        settlement_utr
+          ? `यह राशि ${txn.bank_name} खाते में IMPS/UPI द्वारा तुरंत जमा कर दी गई है—आप ऊपर 'Check Balance' में अपडेटेड बैलेंस देख सकते हैं।`
+          : `यह अभी L2 स्पेशलिस्ट के पास वेरिफिकेशन में है और अप्रूवल मिलते ही क्रेडिट हो जाएगा।`
+      }`,
+      english: `Official UTR & Bank Proof: For ${txn.txn_id} (${amtFormatted} at ${shortMerchant}), Original NPCI RRN is ${txn.utr} and Settlement UTR is ${refUtr}. ${
+        settlement_utr
+          ? `Funds are credited to ${txn.bank_name} immediately—tap 'Check Balance' at the top to see your updated balance.`
+          : `Currently queued at L2 Specialist checkpoint for priority sign-off.`
+      }`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+    };
+  }
+
+  // Tailor response when user asks about DOUBLE DEBIT / PAID TWICE
+  if (queryFocus === 'DOUBLE_DEBIT_DUPLICATE') {
+    return {
+      indic: `डबल-डेबिट सुरक्षा जांच: हमने ${shortMerchant} के ${amtFormatted} ट्रांजैक्शन (${txn.txn_id}) पर Idempotency Lock (IDEMP-${txn.txn_id}) लगा दिया है। फेल हुए ट्रांजैक्शन की पूरी राशि ${amtFormatted} आपके ${txn.bank_name} खाते में वापस कर दी गई है (UTR: ${refUtr})।`,
+      english: `Double-Debit Protection Verified: ResolveOps locked ${txn.txn_id} with idempotency key IDEMP-${txn.txn_id} so you cannot be charged twice. The failed ${amtFormatted} leg at ${shortMerchant} has been reversed to ${txn.bank_name} (UTR: ${refUtr}).`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+    };
+  }
+
+  // Tailor response when user asks about RBI COMPENSATION / T+5 SLA
+  if (queryFocus === 'RBI_COMPENSATION_SLA') {
+    if (decision === 'AUTO_REVERSE_RBI_COMP' || rbi_compensation_inr > 0) {
+      const totalCredited = txn.amount + rbi_compensation_inr;
+      return {
+        indic: `RBI TAT मुआवजा विवरण: ${shortMerchant} का ${amtFormatted} ट्रांजैक्शन RBI की T+5 दिन की सीमा से 2 दिन अधिक अटका रहा। नियम अनुसार मूल राशि ${amtFormatted} + ₹${rbi_compensation_inr} मुआवजा (₹100/दिन), कुल ₹${totalCredited.toLocaleString('en-IN')} आपके ${txn.bank_name} खाते में जमा कर दिया गया है (UTR: ${refUtr})।`,
+        english: `RBI TAT Compensation Breakdown: Because ${txn.txn_id} (${amtFormatted} at ${shortMerchant}) breached the RBI T+5 day auto-reversal mandate by 2 days, ResolveOps credited ${amtFormatted} principal + ₹${rbi_compensation_inr} suo-motu penalty (Total: ₹${totalCredited.toLocaleString('en-IN')}) under UTR ${refUtr}.`,
+        sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+      };
+    }
+    return {
+      indic: `RBI TAT SLA जांच: ट्रांजैक्शन ${txn.txn_id} (${amtFormatted}) आज ही T+0 क्लियरिंग विंडो में हल हो गया है (T+5 दिन की देरी नहीं हुई है)। इसलिए आपका ${amtFormatted} बिना किसी देरी के UTR ${refUtr} के तहत सेटल कर दिया गया है।`,
+      english: `RBI TAT SLA Check: Transaction ${txn.txn_id} (${amtFormatted} at ${shortMerchant}) was resolved within the T+0 same-day window (well inside RBI's T+5 day mandate). Principal ${amtFormatted} is settled under Reference ${refUtr}.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
+    };
+  }
+
+  // Tailor response when user asks about SECURITY / FRAUD / ACCOUNT SAFETY
+  if (queryFocus === 'SECURITY_RISK_FREEZE') {
+    return {
+      indic: `अकाउंट सुरक्षा रिपोर्ट: MCP-B फ्रॉड डेस्क ने आपके खाते की जांच की है (Risk Score: ${risk_score.toFixed(2)}, Switch: ${switch_code})। ${
+        decision === 'HITL'
+          ? `उच्च सुरक्षा मानकों के कारण ₹${txn.amount.toLocaleString('en-IN')} का यह ट्रांजैक्शन सीनियर स्पेशलिस्ट की निगरानी में सुरक्षित होल्ड पर है।`
+          : `आपका खाता पूरी तरह सुरक्षित है और ₹${txn.amount.toLocaleString('en-IN')} की राशि UTR ${refUtr} के साथ सुरक्षित रूप से सेटल कर दी गई है।`
+      }`,
+      english: `Account Security Report: MCP-B Fraud & Velocity Desk audited ${txn.txn_id} (Risk Score: ${risk_score.toFixed(2)}, Switch: ${switch_code}). ${
+        decision === 'HITL'
+          ? `To protect your funds, this ${amtFormatted} transaction is held at L2 Specialist checkpoint before any ledger movement.`
+          : `Your account is verified safe and ${amtFormatted} has been securely settled under UTR ${refUtr}.`
+      }`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
     };
   }
 
   if (decision === 'HITL') {
+    const hitlReasonHi =
+      txn.amount > 25000
+        ? `यह राशि ₹25,000 की ऑटो-रिफंड सीमा से अधिक (${amtFormatted}) है`
+        : switch_code === 'U16'
+        ? `NPCI ने इस पर U16 रिस्क डिक्लाइन कोड लगाया है`
+        : `इस पर वेलोसिटी रिस्क स्कोर ${risk_score.toFixed(2)} पाया गया है`;
+    const hitlReasonEn =
+      txn.amount > 25000
+        ? `amount ${amtFormatted} exceeds the ₹25,000 autonomous reversal cap`
+        : switch_code === 'U16'
+        ? `NPCI flagged code U16 (Risk Threshold Decline)`
+        : `account velocity risk score is ${risk_score.toFixed(2)}`;
+
     return {
-      indic: `नमस्ते ${shortMerchant} जी, आपका ${amtFormatted} का ट्रांजैक्शन (${txn.txn_id}) सुरक्षा जांच के लिए सीनियर ऑपरेशंस टीम को भेजा गया है। ऑपरेटर की मंजूरी मिलते ही तुरंत सेटलमेंट हो जाएगा।`,
-      english: `Hello ${shortMerchant}, transaction ${txn.txn_id} for ${amtFormatted} is paused at Human-in-the-Loop review due to policy thresholds. Pre-audited dossier is ready for 1-click approval.`,
-      sarvam_model: 'sarvam-bulbul:v1 (Meera Female Voice)',
+      indic: `नमस्ते, ${shortMerchant} पर आपका ${amtFormatted} का ट्रांजैक्शन (${txn.txn_id}) जांचा गया है। चूंकि ${hitlReasonHi}, इसे 3-Way ऑडिट डोजियर के साथ L2 सीनियर स्पेशलिस्ट को भेजा गया है। ऑपरेटर अप्रूवल मिलते ही रिफंड पूरा हो जाएगा।`,
+      english: `Hello, we audited ${txn.txn_id} (${amtFormatted} at ${shortMerchant}). Because ${hitlReasonEn}, ResolveOps paused autonomous execution and routed a pre-audited 3-way dossier to our L2 Specialist for 1-click sign-off.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
     };
   }
 
   if (decision === 'AUTO_REVERSE_RBI_COMP') {
     const totalCredited = txn.amount + rbi_compensation_inr;
     return {
-      indic: `नमस्ते ${shortMerchant} जी, आपका ${amtFormatted} का पेमेंट RBI T+5 समय-सीमा से अधिक अटका रहा। Paytm ResolveOps ने मूल राशि ${amtFormatted} के साथ ₹${rbi_compensation_inr} का RBI TAT मुआवजा (कुल ₹${totalCredited.toLocaleString('en-IN')}) ग्राहक के खाते में क्रेडिट कर दिया है। रेफरेंस UTR: ${settlement_utr}।`,
-      english: `Hello ${shortMerchant}, since this ${amtFormatted} failed transaction breached the RBI T+5 Turnaround Time mandate, ResolveOps has credited the ${amtFormatted} principal plus ₹${rbi_compensation_inr} suo-motu RBI compensation (₹100/day). UTR: ${settlement_utr}.`,
-      sarvam_model: 'sarvam-bulbul:v1 (Meera Female hi-IN)',
+      indic: `नमस्ते, ${shortMerchant} का ${amtFormatted} पेमेंट (${txn.txn_id}) RBI T+5 समय-सीमा से अधिक अटका रहा। Paytm ResolveOps ने मूल राशि ${amtFormatted} के साथ ₹${rbi_compensation_inr} का RBI TAT मुआवजा (कुल ₹${totalCredited.toLocaleString('en-IN')}) आपके ${txn.bank_name} खाते में जमा कर दिया है। UTR: ${settlement_utr}।`,
+      english: `Hello, since your ${amtFormatted} transaction at ${shortMerchant} (${txn.txn_id}) breached the RBI T+5 Turnaround Time mandate, ResolveOps credited ${amtFormatted} principal plus ₹${rbi_compensation_inr} suo-motu RBI compensation (Total: ₹${totalCredited.toLocaleString('en-IN')}) to ${txn.bank_name}. UTR: ${settlement_utr}.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
     };
   }
 
   if (decision === 'CREDIT_RETRY') {
     if (lang === 'ta-IN') {
       return {
-        indic: `வணக்கம் ${shortMerchant}, உங்கள் ${amtFormatted} பரிவர்த்தனை (${txn.utr}) NPCI சுவிட்சில் வெற்றி பெற்றது. Paytm ResolveOps உங்கள் கணக்கில் உடனடியாக வரவு வைத்துள்ளது. UTR: ${settlement_utr}.`,
+        indic: `வணக்கம் ${shortMerchant}, உங்கள் ${amtFormatted} பரிவர்த்தனை (${txn.utr}) NPCI சுவிட்சில் (${switch_code}) வெற்றி பெற்றது. Paytm ResolveOps உங்கள் கணக்கில் உடனடியாக வரவு வைத்துள்ளது. UTR: ${settlement_utr}.`,
         english: `Hello ${shortMerchant}, customer debit for ${amtFormatted} succeeded at NPCI switch (${switch_code}). ResolveOps executed an NPCI URCS credit adjustment to your merchant ledger. Reference UTR: ${settlement_utr}.`,
-        sarvam_model: 'sarvam-bulbul:v1 (Meera Female ta-IN)',
+        sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
       };
     }
     return {
-      indic: `नमस्ते ${shortMerchant} जी, 3-Way रिकॉन्सिलिएशन में आपका ${amtFormatted} का पेमेंट NPCI स्विच (${switch_code}) पर सफल पाया गया है। Paytm ResolveOps ने URCS क्रेडिट एडजस्टमेंट द्वारा आपके मर्चेंट लेजर में राशि जमा कर दी है। रेफरेंस UTR: ${settlement_utr}।`,
-      english: `Hello ${shortMerchant}, 3-Way Reconciliation confirmed your ${amtFormatted} payment succeeded at NPCI (${switch_code}). ResolveOps has credited your merchant ledger via URCS Credit Adjustment. UTR: ${settlement_utr}.`,
-      sarvam_model: 'sarvam-bulbul:v1 (Meera Female hi-IN)',
+      indic: `नमस्ते, 3-Way रिकॉन्सिलिएशन में ${shortMerchant} का ${amtFormatted} पेमेंट (${txn.txn_id}) NPCI स्विच (${switch_code}) पर सफल पाया गया है। Paytm ResolveOps ने URCS क्रेडिट एडजस्टमेंट द्वारा मर्चेंट लेजर में ${amtFormatted} तुरंत जमा कर दिया है। UTR: ${settlement_utr}।`,
+      english: `Hello, 3-Way Reconciliation confirmed the ${amtFormatted} payment to ${shortMerchant} (${txn.txn_id}) succeeded at NPCI (${switch_code}). ResolveOps has credited the merchant ledger via URCS Credit Adjustment. UTR: ${settlement_utr}.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
     };
   }
 
   if (decision === 'INFO_ONLY') {
     if (switch_code === 'PENDING') {
       return {
-        indic: `नमस्ते ${shortMerchant} जी, आपका ${amtFormatted} का ट्रांजैक्शन (${txn.txn_id}) अभी NPCI क्लियरिंग विंडो में पेंडिंग है। कृपया कुछ मिनट प्रतीक्षा करें, यह अपने आप सेटल हो जाएगा।`,
-        english: `Hello ${shortMerchant}, transaction ${txn.txn_id} for ${amtFormatted} is currently in the NPCI T+0 clearing window (PENDING). No premature reversal needed.`,
-        sarvam_model: 'sarvam-bulbul:v1 (Meera Female hi-IN)',
+        indic: `नमस्ते, ${shortMerchant} का ${amtFormatted} ट्रांजैक्शन (${txn.txn_id}) अभी NPCI T+0 क्लियरिंग विंडो में प्रोसेस हो रहा है (${gateway_hop_trace})। कृपया दोबारा पेमेंट न करें, यह कुछ ही मिनटों में अपने आप सेटल हो जाएगा।`,
+        english: `Hello, transaction ${txn.txn_id} for ${amtFormatted} at ${shortMerchant} is currently active inside the NPCI T+0 clearing window (${gateway_hop_trace}). Please do not pay again; it will settle automatically within minutes.`,
+        sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
       };
     }
     return {
-      indic: `नमस्ते ${shortMerchant} जी, ट्रांजैक्शन ${txn.txn_id} (${amtFormatted}) पहले ही सेटल हो चुका है (UTR: ${settlement_utr || txn.utr})। दोबारा डिडक्शन या डुप्लीकेट रिफंड की कोई आवश्यकता नहीं है।`,
-      english: `Hello ${shortMerchant}, transaction ${txn.txn_id} for ${amtFormatted} is already reconciled in the ledger (UTR: ${settlement_utr || txn.utr}). No duplicate action required.`,
-      sarvam_model: 'sarvam-bulbul:v1 (Meera Female hi-IN)',
+      indic: `नमस्ते, ${shortMerchant} का ${amtFormatted} ट्रांजैक्शन (${txn.txn_id}) पहले ही ${txn.bank_name} खाते में सेटल हो चुका है (UTR: ${settlement_utr || txn.utr})। आपके पैसे पूरी तरह सुरक्षित हैं और किसी डुप्लीकेट कार्रवाई की आवश्यकता नहीं है।`,
+      english: `Hello, transaction ${txn.txn_id} for ${amtFormatted} at ${shortMerchant} is already reconciled in ${txn.bank_name} (UTR: ${settlement_utr || txn.utr}). Your funds are settled and protected against duplicate deduction.`,
+      sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
     };
   }
 
   return {
-    indic: `नमस्ते ${shortMerchant} जी, आपका ${amtFormatted} का पेमेंट ${txn.bank_name} सर्वर टाइमआउट (${switch_code}) की वजह से अटका था। Paytm ResolveOps ने तुरंत ऑटो-रिफंड सेटल कर दिया है। आपका नया सेटलमेंट UTR ${settlement_utr} है।`,
-    english: `Hello ${shortMerchant}, your ${amtFormatted} payment was stuck due to ${txn.bank_name} switch code ${switch_code}. Paytm ResolveOps has autonomously settled the reversal. Reference UTR: ${settlement_utr}.`,
-    sarvam_model: 'sarvam-bulbul:v1 (Meera Female hi-IN)',
+    indic: `नमस्ते, ${shortMerchant} पर आपका ${amtFormatted} का पेमेंट ${txn.bank_name} और NPCI स्विच टाइमआउट (${switch_code}) के कारण अटका था। Paytm ResolveOps ने 3-Way जांच के बाद तुरंत ${amtFormatted} आपके ${txn.bank_name} खाते में रिफंड कर दिया है। नया UTR: ${settlement_utr}।`,
+    english: `Hello, your ${amtFormatted} payment at ${shortMerchant} (${txn.txn_id}) failed due to ${txn.bank_name} / NPCI switch code ${switch_code}. Paytm ResolveOps verified that the merchant was uncredited and instantly refunded ${amtFormatted} to ${txn.bank_name}. Settlement UTR: ${settlement_utr}.`,
+    sarvam_model: 'sarvam-bulbul:v2 (Anushka Voice)',
   };
 }
 
@@ -542,16 +786,17 @@ export async function executeResolveOpsGraph(params: {
     `).run(new Date().toISOString(), txn.txn_id);
   }
 
-  let intentCategory = 'UPI_DEBIT_NOT_CREDITED';
+  const queryFocus = detectUserQueryFocus(guardrail.masked_text);
+  let intentCategory = `${queryFocus}_${txn.txn_id.replace('TXN-', '')}`;
   if (guardrail.prompt_injection_detected) {
     intentCategory = 'ADVERSARIAL_PROMPT_INJECTION';
-  } else if (txn.txn_id === 'TXN-984195') {
+  } else if (txn.txn_id === 'TXN-984195' && queryFocus === 'GENERAL_DISPUTE_RESOLUTION') {
     intentCategory = 'RBI_TAT_SLA_BREACH_CLAIM';
-  } else if (txn.txn_id === 'TXN-984204' || txn.txn_id === 'TXN-984122') {
+  } else if ((txn.txn_id === 'TXN-984204' || txn.txn_id === 'TXN-984122') && queryFocus === 'GENERAL_DISPUTE_RESOLUTION') {
     intentCategory = 'URCS_DEEMED_MERCHANT_SETTLEMENT';
-  } else if (txn.txn_id === 'TXN-984140') {
+  } else if (txn.txn_id === 'TXN-984140' && queryFocus === 'GENERAL_DISPUTE_RESOLUTION') {
     intentCategory = 'RECONCILIATION_STATUS_CHECK';
-  } else if (txn.txn_id === 'TXN-984168') {
+  } else if (txn.txn_id === 'TXN-984168' && queryFocus === 'GENERAL_DISPUTE_RESOLUTION') {
     intentCategory = 'IN_FLIGHT_CLEARING_QUERY';
   }
 
@@ -564,7 +809,7 @@ export async function executeResolveOpsGraph(params: {
     latency_ms: Math.max(18, Date.now() - node1Start),
     summary: guardrail.prompt_injection_detected
       ? `Prompt Injection intercepted (${guardrail.injection_triggers.join(', ')})`
-      : `Redacted ${guardrail.pii_redacted_count} PII entities (${guardrail.redacted_types.join(', ') || 'None'}) · Extracted RRN/UTR ${txn.utr}`,
+      : `Redacted ${guardrail.pii_redacted_count} PII · Focus: ${queryFocus} · Extracted RRN/UTR ${txn.utr}`,
     output_data: {
       masked_payload: guardrail.masked_text,
       pii_redacted_count: guardrail.pii_redacted_count,
@@ -572,6 +817,7 @@ export async function executeResolveOpsGraph(params: {
       extracted_txn_id: txn.txn_id,
       extracted_utr: txn.utr,
       intent_category: intentCategory,
+      query_focus: queryFocus,
       prompt_injection_detected: guardrail.prompt_injection_detected,
     },
   });
@@ -675,7 +921,7 @@ export async function executeResolveOpsGraph(params: {
     },
   });
 
-  const ticket_id = `TKT-${Date.now().toString().slice(-6)}`;
+  const ticket_id = `TKT-${Date.now().toString().slice(-5)}${Math.floor(10 + Math.random() * 89)}`;
   const idempotency_key = params.idempotency_key || `IDEMP-${txn.txn_id}-${txn.utr}`;
   const lang = params.preferred_lang || txn.preferred_lang || 'hi-IN';
 
@@ -843,7 +1089,7 @@ export async function executeResolveOpsGraph(params: {
     });
   }
 
-  // --- LIVE GENAI REASONING ENRICHMENT (Gemini 3.8 Flash) ---
+  // --- LIVE GENAI REASONING ENRICHMENT (Gemini 3.8 Flash + Query-Aware NLU) ---
   const fallbackVoice = buildIndicVoiceScripts({
     txn,
     decision: policyOut.decision,
@@ -851,6 +1097,9 @@ export async function executeResolveOpsGraph(params: {
     settlement_utr: settlementUtr,
     rbi_compensation_inr: policyOut.rbi_compensation_inr,
     lang,
+    user_query: guardrail.masked_text,
+    gateway_hop_trace: branchA.telemetry.gateway_hop_trace,
+    risk_score: branchB.risk.risk_score,
   });
 
   const liveGenAI = await runLiveGenAIWorkflowReasoning({
@@ -858,6 +1107,7 @@ export async function executeResolveOpsGraph(params: {
     txn,
     switch_code: branchA.telemetry.switch_code,
     switch_status: branchA.telemetry.switch_status,
+    gateway_hop_trace: branchA.telemetry.gateway_hop_trace,
     three_way_match_status: branchC.three_way_match_status,
     risk_score: branchB.risk.risk_score,
     policy_decision: policyOut.decision,
@@ -944,7 +1194,7 @@ export async function executeResolveOpsGraph(params: {
   const nowIso = new Date().toISOString();
 
   db.prepare(`
-    INSERT INTO tickets (
+    INSERT OR REPLACE INTO tickets (
       ticket_id, txn_id, user_id, raw_payload, masked_payload,
       pii_redacted_count, prompt_injection_detected, intent_category,
       extracted_utr, amount, switch_code, risk_score,

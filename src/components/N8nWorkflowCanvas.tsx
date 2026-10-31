@@ -21,6 +21,8 @@ import {
   ZoomIn,
   ZoomOut,
   Sparkles,
+  Info,
+  Cpu,
 } from 'lucide-react';
 
 export interface GraphNodeTrace {
@@ -92,7 +94,7 @@ const CANVAS_NODES: CanvasNodeDef[] = [
     id: 'NODE_1_INGEST_PII',
     title: 'Node 1: PII & GenAI NLU',
     subtitle: 'Masks PAN/Card + Intent',
-    toolLabel: 'gemini-3.8-flash + regex',
+    toolLabel: 'ingest_and_mask_pii()',
     x: 232,
     y: 158,
     stepIndex: 1,
@@ -210,6 +212,94 @@ const CANVAS_NODES: CanvasNodeDef[] = [
   },
 ];
 
+// Detailed architectural & operational explanations for every node in the workflow
+const NODE_ARCHITECTURE_GUIDE: Record<
+  string,
+  {
+    stageTitle: string;
+    whatItDoes: string;
+    howItWorks: string;
+  }
+> = {
+  TRIGGER_WEBHOOK: {
+    stageTitle: 'Entry Trigger · Paytm App / Soundbox / NPCI ODR Webhook',
+    whatItDoes:
+      'Receives live dispute requests when a customer taps a transaction in Paytm Balance & History or speaks into a Paytm Soundbox.',
+    howItWorks:
+      'Captures the transaction ID (TXN-ID), 12-digit NPCI RRN/UTR, voice/text complaint payload, and regional language preference (Hindi, English, or Tamil).',
+  },
+  NODE_1_INGEST_PII: {
+    stageTitle: 'Stage 1 of 6 · Node 1: Ingestion, PII Guardrail & NLU Intent',
+    whatItDoes:
+      'Sanitizes sensitive banking PII before any downstream processing, blocks adversarial prompt injection, and classifies the user’s exact issue.',
+    howItWorks:
+      'Applies regex + security guardrails to mask PAN, Aadhaar, and 16-digit card numbers, extracts the 12-digit UTR, and uses GenAI NLU to understand the customer/merchant problem.',
+  },
+  NODE_2A_SWITCH_MCP: {
+    stageTitle: 'Stage 2 of 6 (Parallel Branch A) · MCP Server A: NPCI UDIR Switch Service',
+    whatItDoes:
+      'Polls the NPCI Unified Dispute & Issue Resolution (UDIR) switch in real time to verify the authoritative network status of the UPI payment.',
+    howItWorks:
+      'Calls tool `req_chk_txn(txn_id, utr)` to inspect the NPCI return code (`U69` timeout, `00_SUCCESS`, `DEEMED_UP`, `RB-01`, `U16`, or `PENDING`) and gateway hop trace.',
+  },
+  NODE_2B_FRAUD_MCP: {
+    stageTitle: 'Stage 2 of 6 (Parallel Branch B) · MCP Server B: Fraud & Velocity Desk',
+    whatItDoes:
+      'Evaluates user account risk and velocity patterns in parallel so high-risk or collusive refund claims never get auto-approved.',
+    howItWorks:
+      'Calls tool `check_account_risk(user_id)` to analyze 10-minute transaction burst velocity, 30-day repeat dispute count, and device fingerprint anomalies to output a [0.00 – 1.00] risk score.',
+  },
+  NODE_2C_RECON_TAT_MCP: {
+    stageTitle: 'Stage 2 of 6 (Parallel Branch C) · MCP Server E: 3-Way Recon & RBI TAT Engine',
+    whatItDoes:
+      'Cross-verifies Issuer Bank CBS debit, NPCI Switch clearing, and Paytm Acquirer sub-ledger credit, while checking RBI Turnaround Time (TAT) compliance.',
+    howItWorks:
+      'Calls tool `verify_3way_recon_and_rbi_tat(txn_id)` to pinpoint where funds are stuck and checks if the dispute exceeds the RBI T+5 day SLA (which mandates ₹100/day suo-motu customer compensation).',
+  },
+  NODE_3_POLICY_ROUTER: {
+    stageTitle: 'Stage 3 of 6 · Node 3: Deterministic UDIR & RBI Policy Router',
+    whatItDoes:
+      'Joins telemetry from all 3 parallel MCP servers (A, B, and E) and executes a 100% deterministic policy check to select the safe resolution branch.',
+    howItWorks:
+      'Enforces hard financial rules: Prompt Injection → Security Block (4C); Amount > ₹25,000 or Risk ≥ 0.50 or U16 → L2 Human Escalation (4C); U69 > T+5 days → Refund + ₹100/day RBI Comp (4B); Safe U69 / Uncredited Success → Auto-Settle (4A).',
+  },
+  NODE_4A_AUTO_EXEC: {
+    stageTitle: 'Stage 4 of 6 (Branch 4A) · Node 4A: URCS Ledger Auto-Reversal / Credit Retry',
+    whatItDoes:
+      'Autonomously executes bank reversals or merchant credit adjustments for verified, low-risk disputes (≤ ₹25,000) in under 2 seconds.',
+    howItWorks:
+      'Calls MCP Server C `execute_settlement_reversal()` with an atomic SQLite idempotency key lock (`IDEMP-TXN-UTR`) so duplicate clicks can never double-refund, issuing an official Settlement UTR.',
+  },
+  NODE_4B_RBI_COMP_EXEC: {
+    stageTitle: 'Stage 4 of 6 (Branch 4B) · Node 4B: RBI T+5 Suo-Motu ₹100/Day Penalty & Refund',
+    whatItDoes:
+      'Automatically credits both the stuck principal amount and the mandatory RBI ₹100/day delay penalty when a failed UPI debit breaches T+5 days.',
+    howItWorks:
+      'Calls MCP Server F `credit_rbi_tat_compensation()` to credit principal + ₹200 compensation (2 breach days × ₹100/day) and generates dual settlement & compensation UTRs.',
+  },
+  NODE_4C_HITL_OPS: {
+    stageTitle: 'Stage 4 of 6 (Branch 4C) · Node 4C: Human-in-the-Loop (HITL) Specialist Interrupt',
+    whatItDoes:
+      'Halts autonomous ledger mutation for high-value (> ₹25,000), high-velocity risk (≥ 0.50), or adversarial transactions and hands off to an L2 human specialist.',
+    howItWorks:
+      'Executes a LangGraph `interrupt()` checkpoint via MCP Server D, packaging a pre-audited 3-Way Reconciliation dossier so the L2 officer can Approve or Reject in 1 click.',
+  },
+  NODE_5_INDIC_VOICE: {
+    stageTitle: 'Stage 5 of 6 · Node 5: Sarvam AI Bulbul Indic Voice & Script Synthesis',
+    whatItDoes:
+      'Generates a natural, reassuring spoken and written response in the user’s chosen Indian language (Hindi, Tamil, or English).',
+    howItWorks:
+      'Combines the root-cause diagnosis ("why it happened") and the new Settlement UTR into a localized script and synthesizes natural Indian female voice audio via Sarvam AI Bulbul TTS.',
+  },
+  NODE_6_UDIR_CLOSURE: {
+    stageTitle: 'Stage 6 of 6 · Node 6: NPCI ReqTxnConfirmation & SHA-256 Audit Ledger',
+    whatItDoes:
+      'Broadcasts the final dispute closure status to the NPCI UDIR network bus and seals the execution record in an immutable cryptographic ledger.',
+    howItWorks:
+      'Dispatches `ReqTxnConfirmation (UDIR_AUTOUPDATE)` with the final UTR and appends a SHA-256 hash-chained audit block (`prev_hash + event -> curr_hash`) in SQLite.',
+  },
+};
+
 function createBezierPath(x1: number, y1: number, x2: number, y2: number): string {
   const dx = Math.abs(x2 - x1) * 0.48;
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
@@ -218,7 +308,6 @@ function createBezierPath(x1: number, y1: number, x2: number, y2: number): strin
 export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
   trace,
   policyDecision,
-  ticketStatus,
   activeAnimStep,
   isAnimating,
   selectedCanvasNodeId,
@@ -244,12 +333,12 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
       : 'NODE_4A_AUTO_EXEC';
 
   const STAGE_STEPS = [
-    { step: 1, label: '1. Understand & PII', nodeId: 'NODE_1_INGEST_PII' },
-    { step: 2, label: '2. 3-Way Recon MCP', nodeId: 'NODE_2C_RECON_TAT_MCP' },
-    { step: 3, label: '3. Decide Policy', nodeId: 'NODE_3_POLICY_ROUTER' },
-    { step: 4, label: `4. Act / Handoff (${activeBranch4})`, nodeId: branch4NodeId },
-    { step: 5, label: '5. Indic Voice TTS', nodeId: 'NODE_5_INDIC_VOICE' },
-    { step: 6, label: '6. NPCI ODR Close', nodeId: 'NODE_6_UDIR_CLOSURE' },
+    { step: 1, label: 'Stage 1: Node 1 (PII & NLU)', nodeId: 'NODE_1_INGEST_PII' },
+    { step: 2, label: 'Stage 2: Parallel MCP A, B & E', nodeId: 'NODE_2C_RECON_TAT_MCP' },
+    { step: 3, label: 'Stage 3: Node 3 (Policy Router)', nodeId: 'NODE_3_POLICY_ROUTER' },
+    { step: 4, label: `Stage 4: Branch ${activeBranch4} Execution`, nodeId: branch4NodeId },
+    { step: 5, label: 'Stage 5: Node 5 (Indic Voice)', nodeId: 'NODE_5_INDIC_VOICE' },
+    { step: 6, label: 'Stage 6: Node 6 (NPCI Closure)', nodeId: 'NODE_6_UDIR_CLOSURE' },
   ];
 
   const findTraceForNode = (nodeId: string): GraphNodeTrace | undefined => {
@@ -324,6 +413,26 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
 
   const currentStageNum = activeAnimStep >= 1 && activeAnimStep <= 6 ? activeAnimStep : 6;
 
+  // Determine which node explanation to show right now
+  const activeExplainerNodeId = isAnimating
+    ? STAGE_STEPS.find((s) => s.step === activeAnimStep)?.nodeId || selectedCanvasNodeId
+    : selectedCanvasNodeId || 'NODE_1_INGEST_PII';
+
+  const activeGuide =
+    NODE_ARCHITECTURE_GUIDE[activeExplainerNodeId] || NODE_ARCHITECTURE_GUIDE.NODE_1_INGEST_PII;
+  const activeNodeTrace = findTraceForNode(activeExplainerNodeId);
+
+  // When Stage 2 is running (Parallel MCP A, B, E), also gather all 3 parallel traces so the user sees all 3 MCP servers working together
+  const trace2A = findTraceForNode('NODE_2A_SWITCH_MCP');
+  const trace2B = findTraceForNode('NODE_2B_FRAUD_MCP');
+  const trace2C = findTraceForNode('NODE_2C_RECON_TAT_MCP');
+  const isParallelStage2Selected =
+    (isAnimating && activeAnimStep === 2) ||
+    (!isAnimating &&
+      (selectedCanvasNodeId === 'NODE_2A_SWITCH_MCP' ||
+        selectedCanvasNodeId === 'NODE_2B_FRAUD_MCP' ||
+        selectedCanvasNodeId === 'NODE_2C_RECON_TAT_MCP'));
+
   return (
     <div className="bg-white border border-zinc-200 rounded-xl overflow-hidden shadow-xs">
       {/* Studio Top Debugger Bar */}
@@ -335,11 +444,11 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
           </span>
           <span className="text-zinc-700">|</span>
           <span className="text-xs text-zinc-300 font-medium">
-            {trace.length === 0
-              ? 'Ready — Click "Execute Workflow" or "Speak Problem" on the left'
+            {trace.length === 0 && !isAnimating
+              ? 'Ready — Click "Execute Workflow" to watch step-by-step node execution & live explanation'
               : isAnimating
-              ? `Executing Stage ${activeAnimStep}/6 in real time...`
-              : `Executed ${trace.length} nodes · Active Route: Branch ${activeBranch4} (${policyDecision})`}
+              ? `Executing Stage ${activeAnimStep} of 6 (~2.2s per stage)...`
+              : `Completed ${trace.length} nodes · Route: Branch ${activeBranch4} (${policyDecision}) — Click any node below to inspect`}
           </span>
         </div>
 
@@ -349,7 +458,7 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
             <button
               type="button"
               onClick={() => setZoom((z) => Math.max(0.68, +(z - 0.1).toFixed(2)))}
-              className="px-1.5 py-1 hover:text-white transition-colors"
+              className="px-1.5 py-1 hover:text-white transition-colors cursor-pointer"
               title="Zoom Out Canvas"
             >
               <ZoomOut className="w-3.5 h-3.5" />
@@ -357,7 +466,7 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
             <button
               type="button"
               onClick={() => setZoom(0.78)}
-              className="px-2 py-0.5 hover:text-white transition-colors"
+              className="px-2 py-0.5 hover:text-white transition-colors cursor-pointer"
               title="Reset Fit Zoom"
             >
               {Math.round(zoom * 100)}%
@@ -365,7 +474,7 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
             <button
               type="button"
               onClick={() => setZoom((z) => Math.min(1.0, +(z + 0.1).toFixed(2)))}
-              className="px-1.5 py-1 hover:text-white transition-colors"
+              className="px-1.5 py-1 hover:text-white transition-colors cursor-pointer"
               title="Zoom In Canvas"
             >
               <ZoomIn className="w-3.5 h-3.5" />
@@ -377,10 +486,10 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
               type="button"
               onClick={onReplayAnimation}
               disabled={isAnimating}
-              className="px-2.5 py-1 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 rounded-lg border border-zinc-700 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+              className="px-2.5 py-1 text-xs font-medium bg-zinc-900 hover:bg-zinc-800 text-zinc-200 rounded-lg border border-zinc-700 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50 cursor-pointer"
             >
               <Play className="w-3 h-3 text-emerald-400" />
-              {isAnimating ? 'Running...' : 'Replay Flow'}
+              {isAnimating ? 'Executing...' : 'Replay Slow Step-by-Step'}
             </button>
           )}
 
@@ -397,15 +506,15 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
         </div>
       </div>
 
-      {/* Interactive Stage Scrubber Bar (Allows scrubbing through steps 1..6 when trace is available) */}
+      {/* Interactive Stage Scrubber Bar (Allows scrubbing through stages 1..6 or watching live progress) */}
       <div className="px-4 py-2 bg-zinc-900/95 border-b border-zinc-800 flex items-center justify-between gap-2 overflow-x-auto">
         <div className="flex items-center gap-1">
           {STAGE_STEPS.map((st) => {
             const isStepActive =
-              selectedCanvasNodeId === st.nodeId ||
-              (isAnimating && activeAnimStep === st.step);
+              (isAnimating && activeAnimStep === st.step) ||
+              (!isAnimating && selectedCanvasNodeId === st.nodeId);
             const isStepCompleted =
-              trace.length > 0 && (!isAnimating || activeAnimStep >= st.step);
+              trace.length > 0 && (!isAnimating || activeAnimStep > st.step);
             return (
               <button
                 key={st.step}
@@ -414,14 +523,20 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
                   onSelectCanvasNode(st.nodeId);
                   if (onStepChange) onStepChange(st.step, st.nodeId);
                 }}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-mono transition-all whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
+                className={`px-2.5 py-1 rounded-md text-[11px] font-mono transition-all whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer ${
                   isStepActive
-                    ? 'bg-indigo-600 text-white font-semibold shadow-xs'
+                    ? 'bg-indigo-600 text-white font-semibold shadow-xs ring-2 ring-indigo-400/40'
                     : isStepCompleted
                     ? 'bg-zinc-800/90 text-emerald-400 hover:bg-zinc-800'
                     : 'text-zinc-500 hover:text-zinc-300'
                 }`}
               >
+                {isAnimating && activeAnimStep === st.step && (
+                  <Loader2 className="w-3 h-3 animate-spin text-white" />
+                )}
+                {!isAnimating && isStepCompleted && (
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                )}
                 <span>{st.label}</span>
               </button>
             );
@@ -440,7 +555,7 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
                   onStepChange(found.step, found.nodeId);
                 }
               }}
-              className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+              className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 cursor-pointer"
               title="Previous Stage"
             >
               <ChevronLeft className="w-3.5 h-3.5" />
@@ -455,13 +570,113 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
                   onStepChange(found.step, found.nodeId);
                 }
               }}
-              className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+              className="p-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 cursor-pointer"
               title="Next Stage"
             >
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
           </div>
         )}
+      </div>
+
+      {/* ==================== LIVE NODE EXECUTION EXPLAINER BANNER ==================== */}
+      <div
+        className={`px-4 py-3 border-b transition-colors ${
+          isAnimating
+            ? 'bg-indigo-50/90 border-indigo-200'
+            : 'bg-zinc-50/90 border-zinc-200'
+        }`}
+      >
+        <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+          <div className="space-y-1 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${
+                  isAnimating
+                    ? 'bg-indigo-600 text-white'
+                    : 'bg-zinc-900 text-white'
+                }`}
+              >
+                {isAnimating ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    <span>LIVE EXECUTING STEP {activeAnimStep}/6</span>
+                  </>
+                ) : (
+                  <>
+                    <Info className="w-3 h-3 text-indigo-400" />
+                    <span>NODE ARCHITECTURE EXPLAINER (CLICK ANY NODE)</span>
+                  </>
+                )}
+              </span>
+              <span className="text-xs font-bold text-zinc-900">
+                {isAnimating && activeAnimStep === 2
+                  ? 'Stage 2 of 6 · Parallel Execution: MCP Server A (NPCI Switch) + MCP Server B (Fraud Risk) + MCP Server E (3-Way Recon & RBI TAT)'
+                  : activeGuide.stageTitle}
+              </span>
+            </div>
+
+            <p className="text-xs text-zinc-700 leading-relaxed">
+              <strong className="text-zinc-900">What this node does: </strong>
+              {isAnimating && activeAnimStep === 2
+                ? 'Fires 3 asynchronous MCP tool calls simultaneously to poll NPCI UDIR Switch status (MCP A), evaluate account velocity & device risk (MCP B), and run 3-Way Bank-Switch-Acquirer reconciliation + RBI T+5 SLA verification (MCP E).'
+                : activeGuide.whatItDoes}
+            </p>
+
+            <p className="text-[11px] text-zinc-600 leading-relaxed">
+              <strong className="text-zinc-800">How it works: </strong>
+              {activeGuide.howItWorks}
+            </p>
+          </div>
+
+          {/* Live Telemetry Output Box for the Currently Active / Selected Node */}
+          <div className="lg:w-[390px] shrink-0 bg-white border border-zinc-200/90 rounded-lg p-2.5 text-[11px] space-y-1 shadow-2xs">
+            <div className="flex items-center justify-between font-mono text-[10px] text-zinc-500">
+              <span className="font-bold text-indigo-600 flex items-center gap-1">
+                <Cpu className="w-3 h-3" />
+                <span>LIVE NODE TELEMETRY</span>
+              </span>
+              {activeNodeTrace && (
+                <span className="text-emerald-700 font-semibold">
+                  {activeNodeTrace.latency_ms}ms · {activeNodeTrace.status}
+                </span>
+              )}
+            </div>
+
+            {isParallelStage2Selected && (trace2A || trace2B || trace2C) ? (
+              <div className="space-y-1 font-mono text-[10px] text-zinc-800">
+                {trace2A && (
+                  <div className="truncate">
+                    <strong className="text-violet-700">MCP-A:</strong> {trace2A.summary}
+                  </div>
+                )}
+                {trace2B && (
+                  <div className="truncate">
+                    <strong className="text-violet-700">MCP-B:</strong> {trace2B.summary}
+                  </div>
+                )}
+                {trace2C && (
+                  <div className="truncate">
+                    <strong className="text-violet-700">MCP-E:</strong> {trace2C.summary}
+                  </div>
+                )}
+              </div>
+            ) : activeNodeTrace ? (
+              <div className="space-y-1">
+                <div className="font-mono text-[10px] text-zinc-500 truncate">
+                  Tool: <strong className="text-zinc-800">{activeNodeTrace.tool_called}</strong>
+                </div>
+                <div className="text-zinc-900 font-medium leading-snug">
+                  {activeNodeTrace.summary}
+                </div>
+              </div>
+            ) : (
+              <div className="text-zinc-500 italic">
+                Click &ldquo;Execute Workflow&rdquo; on the left to watch live telemetry stream through each node.
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Interactive Dotted Vector Canvas */}
@@ -575,9 +790,12 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
                     />
 
                     {(isCurrentlyFlowing || (isCompletedEdge && !isAnimating)) && (
-                      <circle r={isCurrentlyFlowing ? '5.5' : '3.5'} fill={isCurrentlyFlowing ? '#4f46e5' : '#10b981'}>
+                      <circle
+                        r={isCurrentlyFlowing ? '6' : '3.5'}
+                        fill={isCurrentlyFlowing ? '#4f46e5' : '#10b981'}
+                      >
                         <animateMotion
-                          dur={isCurrentlyFlowing ? '0.55s' : '2.4s'}
+                          dur={isCurrentlyFlowing ? '0.9s' : '2.6s'}
                           repeatCount="indefinite"
                           path={d}
                         />
@@ -618,7 +836,7 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
 
               let borderClass = 'border-zinc-300 bg-white hover:border-zinc-400';
               if (vState === 'RUNNING') {
-                borderClass = 'border-indigo-600 ring-4 ring-indigo-500/20 bg-white';
+                borderClass = 'border-indigo-600 ring-4 ring-indigo-500/25 bg-indigo-50/30';
               } else if (vState === 'COMPLETED') {
                 borderClass = 'border-emerald-500 bg-white hover:border-emerald-600';
               } else if (vState === 'PAUSED') {
@@ -688,7 +906,9 @@ export const N8nWorkflowCanvas: React.FC<N8nWorkflowCanvasProps> = ({
 
                   <div className="flex items-center justify-between gap-1 pt-1 border-t border-zinc-100 text-[9.5px] font-mono tabular-nums">
                     <span className="text-zinc-500 truncate">{node.toolLabel}</span>
-                    {matchedTrace && vState !== 'IDLE' && vState !== 'SKIPPED' ? (
+                    {vState === 'RUNNING' ? (
+                      <span className="font-bold text-indigo-600 shrink-0">working...</span>
+                    ) : matchedTrace && vState !== 'IDLE' && vState !== 'SKIPPED' ? (
                       <span className="font-semibold text-emerald-700 shrink-0">
                         {matchedTrace.latency_ms}ms
                       </span>

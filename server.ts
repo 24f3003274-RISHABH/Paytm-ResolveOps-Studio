@@ -24,10 +24,12 @@ initDatabase();
 
 // In-memory cache for generated female TTS WAV clips so replays are instant
 const ttsAudioCache = new Map<string, { provider: string; audio_base64: string; mime_type: string }>();
+let geminiLiteTtsQuotaExhausted = false;
+let geminiFlashTtsQuotaExhausted = false;
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '15mb' }));
 
@@ -207,12 +209,53 @@ async function startServer() {
         return;
       }
 
-      // 1. Try Sarvam AI Bulbul TTS if SARVAM_API_KEY is configured (tries bulbul:v2 'anushka' then bulbul:v1 'meera')
+      // 1. Try Sarvam AI Bulbul TTS if SARVAM_API_KEY is configured (tries bulbul:v3 'priya', bulbul:v2 'anushka', bulbul:v1 'meera')
       const sarvamKey = process.env.SARVAM_API_KEY?.trim();
       if (sarvamKey && sarvamKey.length > 5 && sarvamKey !== 'OPTIONAL_SARVAM_API_KEY') {
         const sarvamAttempts = [
-          { model: 'bulbul:v2', speaker: 'anushka' },
-          { model: 'bulbul:v1', speaker: 'meera' },
+          {
+            model: 'bulbul:v3',
+            speaker: 'priya',
+            body: {
+              inputs: [cleanText],
+              target_language_code: lang,
+              speaker: 'priya',
+              pace: 1.0,
+              speech_sample_rate: 22050,
+              enable_preprocessing: true,
+              model: 'bulbul:v3',
+            },
+          },
+          {
+            model: 'bulbul:v2',
+            speaker: 'anushka',
+            body: {
+              inputs: [cleanText],
+              target_language_code: lang,
+              speaker: 'anushka',
+              pitch: 0,
+              pace: 1.0,
+              loudness: 1.5,
+              speech_sample_rate: 22050,
+              enable_preprocessing: true,
+              model: 'bulbul:v2',
+            },
+          },
+          {
+            model: 'bulbul:v1',
+            speaker: 'meera',
+            body: {
+              inputs: [cleanText],
+              target_language_code: lang,
+              speaker: 'meera',
+              pitch: 0,
+              pace: 1.0,
+              loudness: 1.5,
+              speech_sample_rate: 22050,
+              enable_preprocessing: true,
+              model: 'bulbul:v1',
+            },
+          },
         ];
 
         for (const attempt of sarvamAttempts) {
@@ -223,17 +266,7 @@ async function startServer() {
                 'Content-Type': 'application/json',
                 'api-subscription-key': sarvamKey,
               },
-              body: JSON.stringify({
-                inputs: [cleanText],
-                target_language_code: lang,
-                speaker: attempt.speaker,
-                pitch: 0,
-                pace: 1.0,
-                loudness: 1.5,
-                speech_sample_rate: 22050,
-                enable_preprocessing: true,
-                model: attempt.model,
-              }),
+              body: JSON.stringify(attempt.body),
             });
 
             if (sarvamResp.ok) {
@@ -255,60 +288,83 @@ async function startServer() {
         }
       }
 
-      // 2. Use Gemini 3.8 Flash Lite TTS with 'Kore' (Supported natural Indian woman voice returning 24kHz WAV)
+      // 2. Use Gemini TTS with 'Kore' (Supported natural Indian woman voice returning 24kHz WAV) if quota is available
       const geminiKey = process.env.GEMINI_API_KEY?.trim();
       if (geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') {
-        try {
-          const ai = new GoogleGenAI({
-            apiKey: geminiKey,
-            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-          });
+        const ai = new GoogleGenAI({
+          apiKey: geminiKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+        });
 
-          const response = await ai.models.generateContent({
+        const ttsModelsToTry: Array<{ model: string; isExhausted: () => boolean; markExhausted: () => void }> = [
+          {
             model: 'gemini-3.8-flash-lite-tts',
-            contents: [
-              {
-                role: 'user',
-                parts: [
-                  {
-                    text: cleanText,
-                    speechMetadata: {
-                      style:
-                        'Warm, natural, polite Indian woman fintech support specialist speaking clearly and reassuringly',
+            isExhausted: () => geminiLiteTtsQuotaExhausted,
+            markExhausted: () => {
+              geminiLiteTtsQuotaExhausted = true;
+            },
+          },
+          {
+            model: 'gemini-3.8-flash-tts',
+            isExhausted: () => geminiFlashTtsQuotaExhausted,
+            markExhausted: () => {
+              geminiFlashTtsQuotaExhausted = true;
+            },
+          },
+        ];
+
+        for (const ttsAttempt of ttsModelsToTry) {
+          if (ttsAttempt.isExhausted()) continue;
+          try {
+            const response = await ai.models.generateContent({
+              model: ttsAttempt.model,
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      text: cleanText,
+                      speechMetadata: {
+                        style:
+                          'Warm, natural, polite Indian woman fintech support specialist speaking clearly and reassuringly',
+                      },
                     },
+                  ],
+                },
+              ],
+              config: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: 'Kore' },
                   },
-                ],
-              },
-            ],
-            config: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: 'Kore' },
                 },
               },
-            },
-          });
+            });
 
-          const base64Audio =
-            response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-          if (base64Audio) {
-            const payload = {
-              provider: 'Sarvam / Kore Neural Indic Voice (24kHz WAV)',
-              audio_base64: base64Audio,
-              mime_type: 'audio/wav',
-            };
-            ttsAudioCache.set(cacheKey, payload);
-            res.json(payload);
-            return;
+            const base64Audio =
+              response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            if (base64Audio) {
+              const payload = {
+                provider: 'Sarvam / Kore Neural Indic Voice (24kHz WAV)',
+                audio_base64: base64Audio,
+                mime_type: 'audio/wav',
+              };
+              ttsAudioCache.set(cacheKey, payload);
+              res.json(payload);
+              return;
+            }
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            if (errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('quota')) {
+              ttsAttempt.markExhausted();
+            }
           }
-        } catch (err) {
-          console.error('Gemini TTS error:', err);
         }
       }
 
       res.json({
-        provider: 'Indic Voice Synthesis',
+        provider: 'Sarvam AI / Web Speech Indic Voice',
         audio_base64: null,
         mime_type: null,
       });
